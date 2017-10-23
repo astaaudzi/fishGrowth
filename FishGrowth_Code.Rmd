@@ -1,0 +1,535 @@
+---
+title: Main code for the = Emergent life-history strategies in a general condition-dependent
+  ectotherm growth model with energetic cost of reproduction
+author: "Asta Audzijonyte & Shane A. Richards"
+date: "23 October 2017"
+output:
+  html_document: default
+---
+
+## Growth model
+
+### Useful functions
+
+```{r message=FALSE, warning=FALSE}
+rm(list = ls()) # clear memory
+library(tidyverse)
+library(tibble)
+library(ggplot2)
+
+
+# Reserve:Struture ratio 
+RSRatio <- function(age) {
+  tmp <- rs1*(age-a_bar)
+  tmp <- max(tmp, -20) # bound below
+  tmp <- min(tmp,  20) # bound above
+
+  return(rs_min + (rs_max - rs_min)*exp(tmp) / (1.0 + exp(tmp)))
+} 
+
+# Predator length [m]
+predatorLength <- function(S) {
+  return((S/l_const)^(1/3.0)) # assumes invariant growth
+} 
+
+# Mortality rate [d-1]
+mortProb <- function(l) {
+  m_rate <- m_min + (m_max-m_min)*exp(-m1*l) # instantaneous mortality rate
+  return(1.0 - exp(-m_rate)) # probability die per day
+} 
+
+# intake rate [d d-1]
+grossIntake <- function(S) {
+  return(g0*S^g1)
+}
+
+# DEB maintenance version [g d-1 g-1]
+maintenance <- function(S, R) {
+  return(ms*S + mr*w*R)
+} 
+
+# Energetic reproductive cost
+reproCost <- function(S) {
+  return(ra*S^rb)
+}
+```
+
+### Model parameters for baseline zero fishing scenario
+
+```{r message=FALSE, warning=FALSE}
+
+# Model parameters for the baseline zero fishing scenario (First scenario in Table S2)
+
+max_age_years <- 20 # 20        # years of simulation
+max_age_days  <- 365*max_age_years # (d)
+
+rs_max  <- 1.3           # maximum RS ratio
+rs_min  <- 0.0           # minimum RS ratio
+
+## length-weight conversion: 
+l_const <- 1250/(0.60^3) # (g m-1) num = weight (g), denom = length (m)
+#length-weight conversion uses weight of S only and assumes that 1250g of S weight (ca 3000g of total) corresponds to 60cm long fish
+
+g0      <- 0.1           # intake rate constant: intake when structural weight is 1 g (g d-1), includes assimilation efficiency 
+g1      <- 0.67          # power to uptake rate with S weight
+
+ms      <- 0.003         # maintenance cost of structural mass (g d-1 g-1)
+mr      <- 0.0003        # maintenance cost of reversible mass (g d-1 g-1)  
+
+s_eff   <- 0.33          # conversion efficiency of assimilated intake to structure
+r_eff   <- 0.9           # conversion efficiency of assimilated intake to reversible pool
+
+# Reproductive cost function 
+ra      <- 6             # reprod cost for 1 g of struct weight: (g g-1)
+rb      <- 0.6          # reproductive cost power w.r.t. structural weight
+
+#Mortality parameters 
+m_min   <- 0.1/365      # background mortality rate (d-1) 
+
+m1      <- 8.0          # steepness of the length-dependent mortality rate 
+m_max   <- 4/365        # maximum length-dependent mortality rate (d-1) [when zero length]
+
+s1      <- 7.0          # steepness of the condition realted mortality rate [low value = higher stochasticity]
+s_max   <- 4/365        # maximum condition related rate (d-1) [when R = 0]
+
+#Fishing mortality parameters 
+Fm = 0/365            #Instantaneous fishing mortality of fully recruited fish (day-1)
+Fmid = 0.3              #length (in meters) of the 50% fishing selectivity
+Fk = 20                 # steepness of the logistic fishing function 
+
+#Three parameters for optimal life-history strategy must be optimised for different mortality values in another code. These values are for the baseline zero fishing scenario with above parameters
+
+rs1     <- 0.002   # age-dependence (d-1) [provided by grid]
+a_bar   <- 350          # age at mid-point (d) [provided by grid]
+w       <- 0.6        # fraction of reserve which is reproductive (fixed)
+
+
+```
+
+### Plots to explore age specific R/S allocation, expected survival and reproduction cost
+
+```{r fig.height = 3, fig.width=5}
+
+# bounds for plotting
+l_min   <- 0.0           # minimum length for plotting (m)
+l_max   <- 0.45          # maximum length for plotting (m)
+w_min   <- 1             # minimum mortality rate for plotting (d-1)
+w_max   <- 10000          # maximum mortality rate for plotting (d-1)
+  
+# prepare data frame to display RS ratio
+vec_age <- seq(from = 0, to = max_age_days, by = 1)
+df_RS <- tibble(Age = vec_age, RSratio = sapply(vec_age, FUN = RSRatio))
+ggplot(df_RS, aes(x = Age, y = RSratio)) + geom_line() + 
+  ylim(0,rs_max) + xlab("Age (days)") + ylab("Ratio (Reserve:Structure)") +
+  labs(title = "Strategy: desired ratio of structural to reserve mass") +
+  theme_bw()
+
+# prepare data frame to display survival curve
+vec_length <- seq(from = l_min, to = l_max, length.out = 101)
+df_Length <- tibble(Length = vec_length, Prob = mortProb(vec_length))
+df_Length <- mutate(df_Length, Survive_Y = 1.0/(Prob*365.0))
+ggplot(df_Length, aes(x = Length, y = Survive_Y)) + geom_line() + 
+  labs(title = "Starvation independent survivorship") +
+  xlab("Length (m)") + ylab("Expected years survive") + theme_bw()
+
+# prepare data frame to display reproductive costs
+vec_weight <- seq(from = w_min, to = w_max, length.out = 101)
+df_weight <- tibble(Weight = vec_weight, Cost = reproCost(vec_weight))
+ggplot(df_weight, aes(x = Weight, y = Cost)) + geom_line() + 
+  geom_abline(intercept = 0, slope = 1, color = "grey") +
+  labs(title = "Cost of reproduction (mass not converted to spawn)") +
+  xlab("Structural weight (g)") + ylab("Reproductive cost (g)") + theme_bw()
+
+
+
+```
+
+
+### Main calculations
+
+```{r}
+# useful age-dependent values
+Res               <- array(data=0,c(max_age_years,365)) # reserve mass (g)
+Str               <- array(data=0,c(max_age_years,365)) # structural mass (g)
+dayIntake         <- array(data=0,c(max_age_years,365))
+dayMaintenance    <- array(data=0,c(max_age_years,365))
+dayNetIntake      <- array(data=0,c(max_age_years,365))
+dayLambda         <- array(data=0,c(max_age_years,365))
+dayPredatorLength <- array(data=0,c(max_age_years,365))
+daySurvival       <- array(data=0,c(max_age_years,365))
+yearSpawn         <- rep(0, max_age_years)
+yearRepCost       <- rep(0, max_age_years)
+yearFitness       <- rep(0, max_age_years)
+natmortality      <- array(data=0,c(max_age_years,365))
+fishmortality     <- array(data=0,c(max_age_years,365))
+dayGrowth         <- array(data=0,c(max_age_years,365))
+relGrowth         <- array(data=0,c(max_age_years,365))
+strGrowth         <- array(data=0,c(max_age_years,365))
+
+# set initial weight
+#S0       <- 1             # initial structural weight on day 0 (g)
+#R0       <- S0*RSRatio(0) # enforce correct initial reserve-structural ratio
+
+S0 <- 1/(1+RSRatio(0))
+R0 <- RSRatio(0) *S0
+
+Res[1,1] <- R0
+Str[1,1] <- S0
+
+daySurvival[1,1] <- 1.0 # initially all individuals are alive
+
+  
+# perform the simulation
+for (yr in 1:max_age_years) {
+  for (day in 1:364) {
+    Rstart <- Res[yr,day] # starting mass (reserve)
+    Sstart <- Str[yr,day] # starting mass (structure)
+    
+    dayPredatorLength[yr,day] <- (Sstart/l_const)^(1/3.0) # calc length using str
+    fish_mort <- Fm / (1+exp(-Fk*(dayPredatorLength[yr,day]-Fmid)))
+    mort_rate <- 
+      m_min + (m_max-m_min)*exp(-m1*dayPredatorLength[yr,day]) + # non-starve
+      s_max*exp(-s1*Rstart/Sstart)   +                            # starve
+      fish_mort                                                   #fishing mortality 
+    fishmortality[yr,day+1] <- fish_mort   
+    mort_prob <- 1.0 - exp(-mort_rate) # probability die this day
+    daySurvival[yr,day+1] <- (1-mort_prob)*daySurvival[yr,day] # prob alive
+    natmortality[yr,day+1] <-
+      m_min + (m_max-m_min)*exp(-m1*dayPredatorLength[yr,day]) + # non-starve
+      s_max*exp(-s1*Rstart/Sstart)
+
+  
+    intake      <- g0*Sstart^g1                 # (g d-1)
+    respiration <- ms*Sstart + mr*Rstart        # (g d-1)
+    net_intake  <- intake - respiration         # (g d-1)
+
+    dayIntake[yr, day]      <- intake
+    dayMaintenance[yr, day] <- respiration
+    dayNetIntake[yr, day]   <- net_intake
+    age                     <- 365*(yr-1) + day # age of animal (days)
+      
+    # add bounds to prevent numerical issues when calculating lambda
+    tmp <- rs1*(age-a_bar)
+    tmp <- max(tmp, -20) # bound below
+    tmp <- min(tmp,  20) # bound above
+    dayLambda[yr, day] <- rs_min + (rs_max - rs_min)*exp(tmp) /
+      (1.0 + exp(tmp)) # RS ratio = startegy
+    
+    if (net_intake >= 0) {
+    
+        dR <- r_eff*net_intake # maximum R allocation
+        dS <- s_eff*net_intake # maximum S allocation
+  # use Lambdamax istead of dayLambda and set w=1  
+        if (dayLambda[yr, day]*Sstart > Rstart) { # need to bump up reserves
+          r_take <- min(dayLambda[yr, day]*Sstart - Rstart, dR) 
+          Rstart <- Rstart + r_take
+          net_intake <- net_intake - r_take/r_eff
+        } else { # need to bump up structure
+          s_take <- min(Rstart/dayLambda[yr, day] - Sstart, dS) 
+          Sstart <- Sstart + s_take
+          net_intake <- net_intake - s_take/s_eff
+        }
+     # partition remaining mass to keep desired ratio
+    Res[yr,day+1] <- Rstart + dayLambda[yr, day]*r_eff*s_eff*net_intake / (r_eff + dayLambda[yr, day]*s_eff) 
+    Str[yr,day+1] <- Sstart + r_eff*s_eff*net_intake / (r_eff + dayLambda[yr, day]*s_eff)       
+    
+    } else {
+    
+     dR <- (1/r_eff)*net_intake # this is what should be taken from R given the conversion inefficiencies 
+     newR = (Rstart + dR)
+       if (newR < 0) {
+          newR = 0
+        }
+     
+     Res[yr,day+1] <- newR
+     Str[yr,day+1] <- Sstart
+
+  }  
+
+    Growth = (Res[yr,day+1]+Str[yr,day+1]) - (Res[yr,day]+Str[yr,day]) #change in weight over the day
+    percGrowth = (Growth/(Res[yr,day]+Str[yr,day]))*100
+    sGrowth = Growth/Str[yr,day]*100
+    dayGrowth[yr,day] = Growth
+    relGrowth[yr,day] = percGrowth
+    strGrowth[yr,day] = sGrowth
+    
+}
+
+  dayPredatorLength[yr,365] <- dayPredatorLength[yr,364]
+  dayGrowth[yr,365] <- dayGrowth[yr,364]
+  relGrowth[yr,365] <- relGrowth[yr,364]
+  strGrowth[yr,365] <- strGrowth[yr,364]
+
+  # perform spawning
+  repro_cost <- ra*Str[yr,365]^rb # fixed cost of reproduction
+  spawn_mass <- max(0, w*Res[yr,365] - repro_cost) # spawning mass after cost
+  
+  if (spawn_mass > 0) { # enough to spawn?
+    Res[yr,365]     <- Res[yr,365] - spawn_mass - repro_cost
+    yearSpawn[yr]   <- spawn_mass
+    yearRepCost[yr] <- repro_cost
+    yearFitness[yr] <- spawn_mass*daySurvival[yr,365]
+  } 
+  
+  if (yr < max_age_years) {
+    Str[yr+1,1]         <- Str[yr,365]
+    Res[yr+1,1]         <- Res[yr,365]
+    daySurvival[yr+1,1] <- daySurvival[yr,365]
+    natmortality[yr+1,1]  <- natmortality[yr,365]
+    fishmortality[yr+1,1]  <- fishmortality[yr,365]
+  }
+}
+```
+
+
+# Fitness
+
+```{r}
+
+sum(yearFitness) # expected fitness
+```
+
+# Main growth plot in reversible and structural mass
+
+```{r fig.width=5, fig.height=3}
+param_value <- NULL
+param_type  <- NULL
+age         <- NULL
+
+for (yr in 1:max_age_years) {
+   param_value  <- c(param_value, Res[yr, ])
+   age   <- c(age, 1:365 + 365*(yr-1))
+   param_type <- c(param_type, rep("Reversible", 365))
+   param_value  <- c(param_value, Str[yr, ])
+   age   <- c(age, 1:365 + 365*(yr-1))
+   param_type <- c(param_type, rep("Structure", 365))
+   df_cost = reproCost(Str[yr,])
+   param_value <- c(param_value, df_cost)
+   age   <- c(age, 1:365 + 365*(yr-1))
+   param_type <- c(param_type, rep("Cost", 365))
+}
+
+df_mass <- tibble(age = age, type = param_type, value = param_value)
+
+ggplot(df_mass, aes(x = age, y = value, color = type)) + 
+  xlab("Age (d)") + ylab("Mass/cost (g)") + ylim(0,NA) +
+  geom_line() + theme_bw()
+
+
+
+
+```
+
+# Other model outputs 
+
+```{r fig.width=12, fig.height=8}
+val  <- NULL
+mtype <- NULL
+age   <- NULL
+
+for (yr in 1:max_age_years) {
+   val   <- c(val, dayIntake[yr, ])
+   age   <- c(age, 1:365 + 365*(yr-1))
+   mtype <- c(mtype, rep("Intake (g d-1)", 365))
+   val   <- c(val, dayMaintenance[yr, ])
+   age   <- c(age, 1:365 + 365*(yr-1))
+   mtype <- c(mtype, rep("Maintenance (g d-1)", 365))
+   val   <- c(val, dayNetIntake[yr, ])
+   age   <- c(age, 1:365 + 365*(yr-1))
+   mtype <- c(mtype, rep("Net Intake (g d-1)", 365))
+   val   <- c(val, dayPredatorLength[yr, ])
+   age   <- c(age, 1:365 + 365*(yr-1))
+   mtype <- c(mtype, rep("Length (m)", 365))
+   val   <- c(val, daySurvival[yr, ])
+   age   <- c(age, 1:365 + 365*(yr-1))
+   mtype <- c(mtype, rep("Survival", 365))
+   val   <- c(val, natmortality[yr, ]*365)
+   age   <- c(age, 1:365 + 365*(yr-1))
+   mtype <- c(mtype, rep("Nat mortality rate (y-1)", 365))
+   val   <- c(val, fishmortality[yr, ]*365)
+   age   <- c(age, 1:365 + 365*(yr-1))
+   mtype <- c(mtype, rep("Fishing mortality rate (y-1)", 365))
+   val   <- c(val, relGrowth[yr, ])
+   age   <- c(age, 1:365 + 365*(yr-1))
+   mtype <- c(mtype, rep("Relative growth, (%/day)", 365))
+   val   <- c(val, Str[yr, ] + Res[yr, ])
+   age   <- c(age, 1:365 + 365*(yr-1))
+   mtype <- c(mtype, rep("Total weight (g)", 365))
+   val   <- c(val, Res[yr, ]/Str[yr, ])
+   age   <- c(age, 1:365 + 365*(yr-1))
+   mtype <- c(mtype, rep("RS ratio", 365))
+   val   <- c(val, 100.0*(Str[yr, ] + Res[yr, ]) /
+       ((100.0*dayPredatorLength[yr, ])^3.0)) # weight = g, length = cm
+   age   <- c(age, 1:365 + 365*(yr-1))
+   mtype <- c(mtype, rep("Condition", 365))
+}
+
+df_rate <- tibble(age = age, val = val, mtype = mtype)
+
+ggplot(filter(df_rate, val > 0), aes(x = age/365, y = val)) + 
+  xlab("Age (years)") + ylab("Value") + ylim(0,NA) +
+  scale_x_continuous(breaks = seq(from = 0, to = max_age_years, by = 2)) +
+  geom_line() + facet_wrap( ~ mtype, scale = "free_y") + theme_bw()
+
+```
+
+#weight plot for cod
+```{r}
+age        <- c(  1,   2,    3,    4,    5,    6,    7,    8,     9)
+
+#values of  mininum and maximum weight observed in empirical studies (Supplementary Table 1)
+weight_min <- c( 50, 200,  500, 1000, 1500, 2000, 3000, 4000,  4000) 
+weight_max <- c(200, 500, 1200, 1900, 3200, 4500, 6000, 7000, 10000)
+
+
+df_ref <- tibble(Year = age, min = weight_min, max = weight_max)
+
+df_weight <- filter(df_rate, age <= 9*365, mtype == "Total weight (g)") %>%
+  select(age, weight = val)
+df_weight$age <- df_weight$age/365
+
+plot(x = df_weight$age, y = df_weight$weight, type = "n", ylim = c(0,10100),
+  xlab = "Age (years)", ylab = "Weight (g)")
+arrows(x0 = df_ref$Year, y0 = df_ref$min, x1 = df_ref$Year, y1 = df_ref$max,
+  length=0.05, angle=90, code=3, col = "grey", lwd = 2)
+lines(x = df_weight$age, y = df_weight$weight, lwd = 1)
+```
+
+#length plot for cod
+```{r}
+age        <- c(   1,    2,    3,    4,    5,    6,    7,    8,    9)
+
+#values of mininum and maximum length observed in empirical studies (Supplementary Table 1)
+length_min <- c(0.12, 0.25, 0.35, 0.45, 0.50, 0.60, 0.65,  0.70, 0.70)
+length_max <- c(0.20, 0.35, 0.45, 0.60, 0.70, 0.75, 0.85,  0.90, 1.00)
+df_ref <- tibble(Year = age, min = length_min, max = length_max)
+
+df_length <- filter(df_rate, age <= 9*365, mtype == "Length (m)") %>%
+  select(age, length = val)
+df_length$age <- df_length$age/365
+
+plot(x = df_length$age, y = df_length$length, type = "n", ylim = c(0,1),
+  xlab = "Age (years)", ylab = "length (m)")
+arrows(x0 = df_ref$Year, y0 = df_ref$min, x1 = df_ref$Year, y1 = df_ref$max,
+  length=0.05, angle=90, code=3, col = "grey", lwd = 2)
+lines(x = df_length$age, y = df_length$length, lwd = 1)
+```
+
+#condition for cod
+```{r}
+df_condition <- filter(df_rate, age <= 9*365, mtype == "Condition") %>%
+  select(age, condition = val)
+df_condition$age <- df_condition$age/365
+
+plot(x = df_condition$age, y = df_condition$condition, type = "n", 
+  ylim = c(0.7,1.4), xlab = "Age (years)", ylab = "Condition")
+
+#Empirically observed conditions are shown with horizontal lines
+abline(h = 0.8, lwd = 2, col = "grey")
+abline(h = 1.4, lwd = 2, col = "grey")
+lines(x = df_condition$age, y = df_condition$condition, lwd = 1)
+```
+
+# Reproduction
+
+```{r fig.width=12, fig.height=3}
+n <- max_age_years
+max_y <- max(c(Res[1:n,364], Str[1:n,364]))
+
+val  <- NULL
+mtype <- NULL
+age   <- NULL
+
+val   <- c(val, yearRepCost[1:n])
+age   <- c(age, 1:n)
+mtype <- c(mtype, rep("Reproductive cost (g)", n))
+
+val   <- c(val, yearSpawn[1:n])
+age   <- c(age, 1:n)
+mtype <- c(mtype, rep("Spawn (g)", n))
+
+val   <- c(val, yearFitness[1:n])
+age   <- c(age, 1:n)
+mtype <- c(mtype, rep("Expected fitness (g)", n))
+
+df_rate <- tibble(age = age, val = val, mtype = mtype)
+
+ggplot(filter(df_rate, val >= 0), aes(x = age, y = val)) + 
+  xlab("Age (years)") + ylab("Value") + ylim(0,NA) +
+  scale_x_continuous(breaks = seq(from = 0, to = max_age_years, by = 2)) +
+  geom_line() + geom_point() + facet_wrap( ~ mtype, scale = "free_y") + theme_bw()
+
+```
+
+# Estimation and plotting of allometric relationships such as intake, maintenance and net intake against structural mass and against total mass
+
+```{r fig.width=12, fig.height=3}
+# structural mass relations
+
+var_value <- NULL
+var_type  <- NULL
+mass      <- NULL
+year      <- NULL
+
+for (yr in 1:(max_age_years-1)) {
+   var_value <- c(var_value, dayNetIntake[yr, ])
+   var_type  <- c(var_type,  rep("Net intake (g d-1)", 365))
+   mass      <- c(mass,      Str[yr, ])
+   year      <- c(year,      rep(yr, 365))
+   var_value <- c(var_value, dayIntake[yr, ])
+   var_type  <- c(var_type,  rep("Intake (g d-1)", 365))
+   mass      <- c(mass,      Str[yr, ])
+   year      <- c(year,      rep(yr, 365))
+   var_value <- c(var_value, dayMaintenance[yr, ])
+   var_type  <- c(var_type,  rep("Maintenance (g d-1)", 365))
+   mass      <- c(mass,      Str[yr, ])
+   year      <- c(year,      rep(yr, 365))
+}
+
+df_rate <- tibble(Val = var_value, Type = var_type, Mass = mass, Year = year)
+```
+
+```{r}
+# total mass relations (structural + reserves)
+
+var_value <- NULL
+var_type  <- NULL
+mass      <- NULL
+year      <- NULL
+
+for (yr in 1:(max_age_years-1)) {
+   var_value <- c(var_value, dayNetIntake[yr, ])
+   var_type  <- c(var_type,  rep("Net intake (g d-1)", 365))
+   mass      <- c(mass,      Str[yr, ] + Res[yr, ])
+   year      <- c(year,      rep(yr, 365))
+   var_value <- c(var_value, dayIntake[yr, ])
+   var_type  <- c(var_type,  rep("Intake (g d-1)", 365))
+   mass      <- c(mass,      Str[yr, ] + Res[yr, ])
+   year      <- c(year,      rep(yr, 365))
+   var_value <- c(var_value, dayMaintenance[yr, ])
+   var_type  <- c(var_type,  rep("Maintenance (g d-1)", 365))
+   mass      <- c(mass,      Str[yr, ] + Res[yr, ])
+   year      <- c(year,      rep(yr, 365))
+}
+
+df_rate2 <- tibble(Val = var_value, Type = var_type, Mass = mass, Year = year)
+```
+
+```{r fig.width=12, fig.height=3}
+ggplot(filter(df_rate, Val != 0 & Year <= 7), 
+  aes(x = Mass, y = Val, color = factor(Year))) + 
+  xlab("Structural mass (g)") + ylab("Value") + ylim(0,NA) +
+  labs(color = "Age\n(years)") + scale_color_brewer(palette="Spectral") +
+  geom_line(size = 1) + facet_wrap( ~ Type, scale = "free_y") + 
+  theme_bw() +
+  theme(panel.background = element_rect(colour = "black", fill = "#E6F5FE"))
+
+ggplot(filter(df_rate2, Val != 0 & Year <= 7), 
+  aes(x = Mass, y = Val, color = factor(Year))) + 
+  xlab("Total mass (g)") + ylab("Value") + ylim(0,NA) +
+  labs(color = "Age\n(years)") + scale_color_brewer(palette="Spectral") +
+  geom_line(size = 1) + facet_wrap( ~ Type, scale = "free_y") + 
+  theme_bw() +
+  theme(panel.background = element_rect(colour = "black", fill = "#E6F5FE"))
+```
+
